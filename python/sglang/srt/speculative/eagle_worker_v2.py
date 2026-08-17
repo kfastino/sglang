@@ -941,11 +941,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
-        if not (staged and can_run_decode_cuda_graph):
-            # This path reads shared buffers after the verify replay; drop the
-            # verify record so the scheduler keeps the coarse whole-forward fence.
-            self.target_worker.model_runner.shared_read_done_event = None
-
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:
@@ -973,6 +968,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
+
+        if not (staged and can_run_decode_cuda_graph):
+            # Un-staged sequencing reads shared buffers after the verify-time
+            # record; re-publish the fence at the step tail (last write wins
+            # the mailbox the scheduler waits on).
+            read_done = torch.get_device_module(self.device).Event()
+            read_done.record()
+            self.target_worker.model_runner.shared_read_done_event = read_done
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
