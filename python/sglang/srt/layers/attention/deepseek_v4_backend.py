@@ -503,6 +503,9 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    # Draft-extend init builds page tables from seq_lens / req_to_token only.
+    supports_draft_extend_metadata_staging: bool = True
+    _draft_extend_swa_out_loc: Optional[torch.Tensor] = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1120,6 +1123,13 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             is_prefill=True,
         )
+        # Stamp the hoisted SWA write locations so store_cache's cached path
+        # is captured instead of an in-graph mapping translate; staged runs
+        # refresh the buffer again once verify's out_cache_loc exists.
+        self.refresh_draft_extend_swa_locs(out_cache_loc)
+        core_attn_metadata.swa_out_cache_loc = self._draft_extend_swa_out_loc[
+            :num_tokens
+        ]
         return DSV4Metadata(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
@@ -1544,6 +1554,11 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        # Hoisted draft-extend SWA write locations: filled outside the graph
+        # (refresh_draft_extend_swa_locs), read by the captured store_cache.
+        self._draft_extend_swa_out_loc = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device=self.device
+        )
         # Verify metadata never extracts the mask. No skip_prefill notion here.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -1596,6 +1611,20 @@ class DeepseekV4AttnBackend(
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
+
+    def refresh_draft_extend_swa_locs(self, out_cache_loc: torch.Tensor) -> None:
+        num_tokens = out_cache_loc.shape[0]
+        buf = self._draft_extend_swa_out_loc
+        if buf is None or buf.shape[0] < num_tokens:
+            # Eager-only sizing; graph runs pre-size in init_cuda_graph_state
+            # (the captured reads need a stable address).
+            buf = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+            self._draft_extend_swa_out_loc = buf
+        buf[:num_tokens].copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int32
+            )
+        )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.

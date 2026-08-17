@@ -472,6 +472,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    pre_launch_hook=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -531,6 +532,11 @@ def run_eagle_verify(
                 else None
             ),
         )
+
+    if pre_launch_hook is not None:
+        # Staged draft-extend: enqueue its remaining shared reads (SWA write
+        # locs) ahead of the verify launch, so they precede the verify record.
+        pre_launch_hook(batch)
 
     # Must stay ahead of the target verify launch below.
     grammar_tree = (

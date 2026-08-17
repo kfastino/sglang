@@ -116,6 +116,16 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # Opt in when this backend's DRAFT_EXTEND_V2 out-graph metadata init is a
+    # pure function of pre-verify state (it may read verify products by shape
+    # only), so the init can be staged before the verify launch.
+    supports_draft_extend_metadata_staging: bool = False
+
+    # Refresh the draft-extend SWA write locations from a fresh out_cache_loc;
+    # no-op for backends without a hoisted SWA loc buffer.
+    def refresh_draft_extend_swa_locs(self, out_cache_loc: torch.Tensor) -> None:
+        pass
+
     # True for backends that preallocate per-seq extend metadata at req-pool
     # size (e.g. triton's kv_indptr): dummy extend batches must then keep
     # batch_size <= req_to_token_pool.size.

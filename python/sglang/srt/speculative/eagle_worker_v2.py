@@ -859,9 +859,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return False
-        # SWA metadata derives its prefix from num_accept_tokens (flashinfer
-        # update_sliding_window), a verify product that does not exist yet.
-        if self.draft_runner.sliding_window_size is not None:
+        if not self.draft_extend_attn_backend.supports_draft_extend_metadata_staging:
             return False
         # The DP-padded width would duplicate init_new's token-unit transform;
         # oversized batches would overflow the bucket pad.
@@ -880,6 +878,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             out_cache_loc_dsv4=getattr(batch, "out_cache_loc_dsv4", None),
         )
         return True
+
+    # Staged runs enqueue this ahead of the verify launch, once verify's
+    # out_cache_loc exists, so the mapping read precedes the verify record.
+    def refresh_draft_extend_swa_locs(self, batch: ScheduleBatch) -> None:
+        self.draft_extend_attn_backend.refresh_draft_extend_swa_locs(
+            batch.out_cache_loc
+        )
 
     def _draft_extend_for_decode(
         self,
@@ -935,6 +940,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+
+        if not (staged and can_run_decode_cuda_graph):
+            # This path reads shared buffers after the verify replay; drop the
+            # verify record so the scheduler keeps the coarse whole-forward fence.
+            self.target_worker.model_runner.shared_read_done_event = None
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -1087,8 +1097,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # With pre-verify staging, draft_extend's shared reads run at plan time
+        # and verify becomes the step's last shared-buffer-reading phase;
+        # without it, draft_extend (on the draft runner) is.
+        backend = self._draft_worker.draft_extend_attn_backend
+        if backend.supports_draft_extend_metadata_staging:
+            return self.target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
@@ -1210,7 +1224,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.spec_info = verify_input
             # Stage draft_extend's shared-buffer reads before the verify launch.
             staged_draft_extend = self.draft_worker._draft_extend_plan_for_decode(batch)
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            batch_output = self.verify(
+                batch,
+                grammar_barrier=grammar_barrier,
+                pre_launch_hook=(
+                    self.draft_worker.refresh_draft_extend_swa_locs
+                    if staged_draft_extend
+                    else None
+                ),
+            )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1529,7 +1551,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+    def verify(self, batch: ScheduleBatch, grammar_barrier=None, pre_launch_hook=None):
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1543,6 +1565,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            pre_launch_hook=pre_launch_hook,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
